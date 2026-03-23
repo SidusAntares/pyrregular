@@ -167,14 +167,13 @@ model.score(X_test, y_test)
 If you use this package in your research, please cite the following paper:
 
 ```bibtex
-@misc{spinnato2025pyrregular,
-      title={PYRREGULAR: A Unified Framework for Irregular Time Series, with Classification Benchmarks}, 
-      author={Francesco Spinnato and Cristiano Landi},
-      year={2025},
-      eprint={2505.06047},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2505.06047}, 
+@inproceedings{
+    spinnato2026pyrregular,
+    title={{PYRREGULAR}: A Unified Framework for Irregular Time Series, with Classification Benchmarks},
+    author={Francesco Spinnato and Cristiano Landi},
+    booktitle={The Fourteenth International Conference on Learning Representations},
+    year={2026},
+    url={https://openreview.net/forum?id=qetBM8nLkf}
 }
 ```
 
