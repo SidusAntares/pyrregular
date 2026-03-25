@@ -39,7 +39,7 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 def parse_args():
     """Parses command line arguments."""
     parser = argparse.ArgumentParser(description='Fine-tune MantisV2 on Timematch dataset.')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
     parser.add_argument('--device', default='cuda:0', type=str, help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
     parser.add_argument('--per', default=0.3, type=float, help='Percentage of labeled samples to use for training/validation.')
     parser.add_argument('--seed', default=111, type=int, help='Random seed for reproducibility.')
@@ -49,7 +49,10 @@ def parse_args():
     parser.add_argument('--num_pixels', default=2, type=int, help='Number of pixels to sample from the input sample.')
     parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample.')
     parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str, help='Path to datasets root directory.')
+
     parser.add_argument('--source', default='france/30TXT/2017', type=str, help='Source domain.')
+    parser.add_argument('--target', default='france/30TXT/2017', type=str)
+
     parser.add_argument('--combine_spring_and_winter', action='store_true', help='Combine spring and winter classes.')
     parser.add_argument('--num_folds', default=1, type=int, help='Number of cross-validation folds.')
     parser.add_argument("--val_ratio", default=0.1, type=float, help='Validation ratio.')
@@ -195,13 +198,16 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
 
     return x_np, y_np
 
-def train(args):
-    """Main training function."""
+
+def train_rocket(args):
+    """使用 pyrregular 的 ROCKET 模型（正确实现）"""
     print("=> Creating dataloader")
     config = args
 
+    # 1. 获取类别和数据集 (与原 train 函数相同)
     source_classes = label_utils.get_classes(
-        config.source.split('/')[0], combine_spring_and_winter=config.combine_spring_and_winter
+        config.source.split('/')[0],
+        combine_spring_and_winter=config.combine_spring_and_winter
     )
     source_data = PixelSetData(config.data_root, config.source, source_classes)
     labels, counts = np.unique(source_data.get_labels(), return_counts=True)
@@ -210,7 +216,7 @@ def train(args):
     config.classes = source_classes
     config.num_classes = len(source_classes)
 
-    # Control sample size
+    # 2. 创建数据划分 (与原 train 函数相同)
     total_num = len(source_data)
     if args.per == 1:
         use_num = total_num
@@ -220,55 +226,87 @@ def train(args):
         print(f"Limiting experiment pool to {use_num} random samples (Seed={args.seed}).")
     else:
         raise ValueError('Percentage must be between 0 and 1')
-    print(f"(Seed={args.seed}).")
 
     # Create splits
     indices = {config.source: use_num}
     folds = create_train_val_test_folds([config.source], config.num_folds, indices, config.val_ratio, config.test_ratio)
+    # indices = {config.source: len(source_data),
+    #            config.target: len(PixelSetData(config.data_root, config.target, source_classes))}
+    # folds = create_train_val_test_folds([config.source, config.target], config.num_folds, indices, config.val_ratio,
+    #                                     config.test_ratio)
+    indices = {config.source: use_num,
+               config.target: use_num}
+    folds = create_train_val_test_folds([config.source, config.target], config.num_folds, indices, config.val_ratio,
+                                        config.test_ratio)
     splits = folds[0]
-    sample_pixels_val = config.sample_pixels_val
-    val_loader, test_loader = create_evaluation_loaders(config.source, splits, config, sample_pixels_val)
+    val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, config.sample_pixels_val)
     source_loader = get_data_loaders(splits, config, config.balance_source)
-
     print(f"Number of classes: {config.num_classes}")
-    device = torch.device(args.device)
+    print(f"Source dataset size: {len(source_data)}")
 
+    # 3. 转换数据为 [n_samples, n_channels, n_timesteps]
+    X_train, y_train = [], []
+    X_test, y_test = [], []
 
-    # --- 5. Evaluate on Test Set ---
-    print("=> Evaluating on test set...")
-    try:
-        y_pred = model.predict(x_test)
+    # 提取训练数据
+    for batch in tqdm(source_loader, desc="Processing train batches"):
+        pixels = batch['pixels'].cpu().numpy()
+        pixels_mean = np.mean(pixels, axis=-1)
+        X_train.append(np.transpose(pixels_mean, (0, 2, 1)))
+        y_train.append(batch['label'].cpu().numpy())
 
-        # Calculate metrics
-        accuracy = np.mean(y_pred == y_test)
-        macro_f1 = f1_score(y_test, y_pred, average='macro', zero_division=0)
+    X_train = np.vstack(X_train)
+    y_train = np.hstack(y_train)
 
-        print(f"Test Accuracy: {accuracy:.4f}")
-        print(f"Test Macro F1-Score: {macro_f1:.4f}")
+    # 提取测试数据
+    for batch in tqdm(test_loader, desc="Processing test batches"):
+        pixels = batch['pixels'].cpu().numpy()
+        pixels_mean = np.mean(pixels, axis=-1)
+        X_test.append(np.transpose(pixels_mean, (0, 2, 1)))
+        y_test.append(batch['label'].cpu().numpy())
 
-        # --- 6. Save Results ---
-        source_name = 'AT1'
-        match args.source:
-            case 'france/30TXT/2017': source_name = 'FR1'
-            case 'france/31TCJ/2017': source_name = 'FR2'
-            case 'denmark/32VNH/2017': source_name = 'DK1'
-            case _: source_name = 'AT1'
+    X_test = np.vstack(X_test)
+    y_test = np.hstack(y_test)
 
-        file_name = f'./results/{source_name}/{args.model}_{args.fine_tuning_type}_{len(x_train)}_{timestamp}_Len{args.seq_len}_Seed{args.seed}.csv'
-        Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+    # 4. 关键修改：使用 pyrregular 的 ROCKET
+    print("\n=> Training ROCKET classifier (pyrregular version)")
+    from pyrregular.models.rocket import rocket_pipeline  # 正确导入
+    model = rocket_pipeline  # 直接使用 pyrregular 的 pipeline
+    model.fit(X_train, y_train)
 
-        results_df = pd.DataFrame({
-            'metric': ['accuracy', 'macro_f1'],
-            'value': [accuracy, macro_f1]
-        })
-        results_df.to_csv(file_name, index=False)
-        print(f"✅ Results saved to {file_name}")
+    # 5. 评估
+    train_score = model.score(X_train, y_train)
+    test_score = model.score(X_test, y_test)
 
-    except Exception as e:
-        print(f"An error occurred during evaluation: {e}")
+    print(f"\npyrregular ROCKET Baseline Results:")
+    print(f"  Train Accuracy: {train_score:.4f}")
+    print(f"  Test Accuracy:  {test_score:.4f}")
+
+    # 6. 保存结果
+    def match(domain):
+        match domain:
+            case 'france/30TXT/2017':
+                return 'FR1'
+            case 'france/31TCJ/2017':
+                return 'FR2'
+            case 'denmark/32VNH/2017':
+                return 'DK1'
+        return 'AT1'
+    source_name = match(config.source)
+    target_name = match(config.target)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    file_name = f'./results/{source_name}/{target_name}/pyrregular_ROCKET_{len(X_train)}_{timestamp}.csv'
+    Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+
+    results_df = pd.DataFrame({
+        'metric': ['train_accuracy', 'test_accuracy'],
+        'value': [train_score, test_score]
+    })
+    results_df.to_csv(file_name, index=False)
+    print(f"✅ Results saved to {file_name}")
 
     return model
-
 
 def main():
     """Main execution function."""
@@ -278,7 +316,7 @@ def main():
 
     for seed in seeds:
         print(f'--- Running with Seed = {seed} ---')
-        # Set seed for this run
+        # Set seed for reproducibility
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -286,8 +324,9 @@ def main():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        trained_model = train(args)
-        print(f'Finished training with Seed = {seed}\n')
+        # === 使用 ROCKET 基线替代 MantisV2 ===
+        trained_model = train_rocket(args)  # 替换为 train_rocket
+        print(f'Finished ROCKET baseline with Seed = {seed}\n')
 
 
 if __name__ == '__main__':
