@@ -244,45 +244,144 @@ def train_rocket(args):
     print(f"Number of classes: {config.num_classes}")
     print(f"Source dataset size: {len(source_data)}")
 
-    # 3. 转换数据为 [n_samples, n_channels, n_timesteps]
-    X_train, y_train = [], []
-    X_test, y_test = [], []
+    # 3. 内存优化：分批收集训练数据
+    print("Collecting training data...")
+    X_train_list, y_train_list = [], []
 
-    # 提取训练数据
     for batch in tqdm(source_loader, desc="Processing train batches"):
         pixels = batch['pixels'].cpu().numpy()
-        pixels_mean = np.mean(pixels, axis=-1)
-        X_train.append(np.transpose(pixels_mean, (0, 2, 1)))
-        y_train.append(batch['label'].cpu().numpy())
+        pixels_mean = np.mean(pixels, axis=-1)  # [B, T, C]
+        X_batch = np.transpose(pixels_mean, (0, 2, 1))  # [B, C, T]
+        y_batch = batch['label'].cpu().numpy()
 
-    X_train = np.vstack(X_train)
-    y_train = np.hstack(y_train)
+        X_train_list.append(X_batch)
+        y_train_list.append(y_batch)
 
-    # 提取测试数据
+        # 控制列表长度，避免内存溢出
+        if len(X_train_list) > 100:  # 每100个batch合并一次
+            X_train_temp = np.vstack(X_train_list)
+            y_train_temp = np.hstack(y_train_list)
+
+            if 'X_train' not in locals():
+                X_train, y_train = X_train_temp, y_train_temp
+            else:
+                X_train = np.vstack([X_train, X_train_temp])
+                y_train = np.hstack([y_train, y_train_temp])
+
+            X_train_list, y_train_list = [], []  # 清空临时列表
+
+    # 处理剩余的数据
+    if X_train_list:
+        X_train_temp = np.vstack(X_train_list)
+        y_train_temp = np.hstack(y_train_list)
+        if 'X_train' not in locals():
+            X_train, y_train = X_train_temp, y_train_temp
+        else:
+            X_train = np.vstack([X_train, X_train_temp])
+            y_train = np.hstack([y_train, y_train_temp])
+
+    print(f"Training data collected: X_train shape = {X_train.shape}, y_train shape = {y_train.shape}")
+
+    # 4. 内存优化：分批收集测试数据
+    print("Collecting test data...")
+    X_test_list, y_test_list = [], []
+
     for batch in tqdm(test_loader, desc="Processing test batches"):
         pixels = batch['pixels'].cpu().numpy()
         pixels_mean = np.mean(pixels, axis=-1)
-        X_test.append(np.transpose(pixels_mean, (0, 2, 1)))
-        y_test.append(batch['label'].cpu().numpy())
+        X_batch = np.transpose(pixels_mean, (0, 2, 1))
+        y_batch = batch['label'].cpu().numpy()
 
-    X_test = np.vstack(X_test)
-    y_test = np.hstack(y_test)
+        X_test_list.append(X_batch)
+        y_test_list.append(y_batch)
 
-    # 4. 关键修改：使用 pyrregular 的 ROCKET
+        # 同样的内存控制
+        if len(X_test_list) > 100:
+            X_test_temp = np.vstack(X_test_list)
+            y_test_temp = np.hstack(y_test_list)
+
+            if 'X_test' not in locals():
+                X_test, y_test = X_test_temp, y_test_temp
+            else:
+                X_test = np.vstack([X_test, X_test_temp])
+                y_test = np.hstack([y_test, y_test_temp])
+
+            X_test_list, y_test_list = [], []
+
+    # 处理剩余的测试数据
+    if X_test_list:
+        X_test_temp = np.vstack(X_test_list)
+        y_test_temp = np.hstack(y_test_list)
+        if 'X_test' not in locals():
+            X_test, y_test = X_test_temp, y_test_temp
+        else:
+            X_test = np.vstack([X_test, X_test_temp])
+            y_test = np.hstack([y_test, y_test_temp])
+
+    print(f"Test data collected: X_test shape = {X_test.shape}, y_test shape = {y_test.shape}")
+
+    # 5. 关键修改：使用 pyrregular 的 ROCKET
     print("\n=> Training ROCKET classifier (pyrregular version)")
     from pyrregular.models.rocket import rocket_pipeline  # 正确导入
     model = rocket_pipeline  # 直接使用 pyrregular 的 pipeline
-    model.fit(X_train, y_train)
 
-    # 5. 评估
-    train_score = model.score(X_train, y_train)
-    test_score = model.score(X_test, y_test)
+    # 6. 训练模型（分批或使用子集，取决于内存）
+    print(f"Starting training with {len(X_train)} samples...")
+
+    # 如果内存仍然不够，可以进一步采样子集
+    if len(X_train) > 20000:  # 如果训练样本超过20000，随机采样
+        print(f"Dataset too large ({len(X_train)} samples), sampling 20000 for training...")
+        indices = np.random.choice(len(X_train), 20000, replace=False)
+        X_train_subset = X_train[indices]
+        y_train_subset = y_train[indices]
+        model.fit(X_train_subset, y_train_subset)
+        print("Training completed on sampled subset.")
+    else:
+        model.fit(X_train, y_train)
+        print("Training completed on full dataset.")
+
+    # 7. 评估（同样可能需要采样）
+    print("Evaluating on training set...")
+    if len(X_train) > 50000:  # 如果训练集太大，采样评估
+        eval_indices = np.random.choice(len(X_train), 50000, replace=False)
+        train_score = model.score(X_train[eval_indices], y_train[eval_indices])
+    else:
+        train_score = model.score(X_train, y_train)
+
+    print("Evaluating on test set...")
+    print("Evaluating on training set...")
+
+    # 预测训练集
+    if len(X_train) > 50000:  # 如果训练集太大，采样评估
+        eval_indices = np.random.choice(len(X_train), 50000, replace=False)
+        y_train_pred = model.predict(X_train[eval_indices])
+        y_train_true = y_train[eval_indices]
+    else:
+        y_train_pred = model.predict(X_train)
+        y_train_true = y_train
+
+    train_acc = (y_train_pred == y_train_true).mean()
+    train_f1 = f1_score(y_train_true, y_train_pred, average='macro')
+
+    print("Evaluating on test set...")
+
+    # 预测测试集
+    if len(X_test) > 50000:  # 如果测试集太大，采样评估
+        eval_indices = np.random.choice(len(X_test), 50000, replace=False)
+        y_test_pred = model.predict(X_test[eval_indices])
+        y_test_true = y_test[eval_indices]
+    else:
+        y_test_pred = model.predict(X_test)
+        y_test_true = y_test
+
+    test_acc = (y_test_pred == y_test_true).mean()
+    test_f1 = f1_score(y_test_true, y_test_pred, average='macro')
 
     print(f"\npyrregular ROCKET Baseline Results:")
-    print(f"  Train Accuracy: {train_score:.4f}")
-    print(f"  Test Accuracy:  {test_score:.4f}")
+    print(f"  Train Accuracy: {train_acc:.4f}, Train Macro-F1: {train_f1:.4f}")
+    print(f"  Test Accuracy:  {test_acc:.4f}, Test Macro-F1:  {test_f1:.4f}")
 
-    # 6. 保存结果
+    # 8. 保存结果
     def match(domain):
         match domain:
             case 'france/30TXT/2017':
@@ -292,6 +391,7 @@ def train_rocket(args):
             case 'denmark/32VNH/2017':
                 return 'DK1'
         return 'AT1'
+
     source_name = match(config.source)
     target_name = match(config.target)
 
@@ -300,13 +400,11 @@ def train_rocket(args):
     Path(file_name).parent.mkdir(parents=True, exist_ok=True)
 
     results_df = pd.DataFrame({
-        'metric': ['train_accuracy', 'test_accuracy'],
-        'value': [train_score, test_score]
+        'metric': ['train_accuracy', 'train_macro_f1', 'test_accuracy', 'test_macro_f1'],
+        'value': [train_acc, train_f1, test_acc, test_f1]
     })
     results_df.to_csv(file_name, index=False)
     print(f"✅ Results saved to {file_name}")
-
-    return model
 
 def main():
     """Main execution function."""
