@@ -31,7 +31,7 @@ from transforms import (
 )
 from torchvision import transforms
 import torch.nn.functional as F
-
+from pyrregular.models.rocket import rocket_pipeline
 # --- Global Variables ---
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -39,9 +39,9 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 def parse_args():
     """Parses command line arguments."""
     parser = argparse.ArgumentParser(description='Fine-tune MantisV2 on Timematch dataset.')
-    parser.add_argument('--epochs', type=int, default=1, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--device', default='cuda:0', type=str, help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
-    parser.add_argument('--per', default=0.3, type=float, help='Percentage of labeled samples to use for training/validation.')
+    parser.add_argument('--per', default=1, type=float, help='Percentage of labeled samples to use for training/validation.')
     parser.add_argument('--seed', default=111, type=int, help='Random seed for reproducibility.')
     parser.add_argument('--num_workers', default=2, type=int, help='Number of workers for data loading.')
     parser.add_argument('--batch_size', type=int, default=500, help='Batch size for training.')
@@ -245,120 +245,67 @@ def train_rocket(args):
     print(f"Source dataset size: {len(source_data)}")
 
     # 3. 内存优化：分批收集训练数据
-    print("Collecting training data...")
-    X_train_list, y_train_list = [], []
+    def data_collect(data_loader):
+        x_temp , y_temp = [], []
+        first_batch = True
+        for batch in tqdm(data_loader, desc="Processing batches"):
+            pixels = batch['pixels'].cpu().numpy()
+            pixels_mean = np.mean(pixels, axis=-1)  # [B, T, C]
+            x = np.transpose(pixels_mean, (0, 2, 1))  # [B, C, T]
+            y = batch['label'].cpu().numpy()
 
-    for batch in tqdm(source_loader, desc="Processing train batches"):
-        pixels = batch['pixels'].cpu().numpy()
-        pixels_mean = np.mean(pixels, axis=-1)  # [B, T, C]
-        X_batch = np.transpose(pixels_mean, (0, 2, 1))  # [B, C, T]
-        y_batch = batch['label'].cpu().numpy()
+            x_temp.append(x)
+            y_temp.append(y)
 
-        X_train_list.append(X_batch)
-        y_train_list.append(y_batch)
+            # 控制列表长度，避免内存溢出
+            if len(x_temp) > 100:  # 每100个batch合并一次
+                x_temp = np.vstack(x_temp)
+                y_temp = np.hstack(y_temp)
+                if first_batch:
+                    x_res, y_res = x_temp, y_temp
+                    first_batch = False
+                else:
+                    x_res = np.vstack([x_res, x_temp])
+                    y_res = np.hstack([y_res, y_temp])
 
-        # 控制列表长度，避免内存溢出
-        if len(X_train_list) > 100:  # 每100个batch合并一次
-            X_train_temp = np.vstack(X_train_list)
-            y_train_temp = np.hstack(y_train_list)
+                x_temp, y_temp = [], []  # 清空临时列表
 
-            if 'X_train' not in locals():
-                X_train, y_train = X_train_temp, y_train_temp
+        # 处理剩余的数据
+        if x_temp:
+            x_temp = np.vstack(x_temp)
+            y_temp = np.hstack(y_temp)
+            if first_batch:
+                x_res, y_res = x_temp, y_temp
             else:
-                X_train = np.vstack([X_train, X_train_temp])
-                y_train = np.hstack([y_train, y_train_temp])
+                x_res = np.vstack([x_res, x_temp])
+                y_res = np.hstack([y_res, y_temp])
+        assert x_res is not None, "dataloader is empty"
+        return x_res, y_res
 
-            X_train_list, y_train_list = [], []  # 清空临时列表
-
-    # 处理剩余的数据
-    if X_train_list:
-        X_train_temp = np.vstack(X_train_list)
-        y_train_temp = np.hstack(y_train_list)
-        if 'X_train' not in locals():
-            X_train, y_train = X_train_temp, y_train_temp
-        else:
-            X_train = np.vstack([X_train, X_train_temp])
-            y_train = np.hstack([y_train, y_train_temp])
-
-    print(f"Training data collected: X_train shape = {X_train.shape}, y_train shape = {y_train.shape}")
+    print("Collecting training data...")
+    x_train, y_train = data_collect(source_loader)
+    print(f"Training data collected: X_train shape = {x_train.shape}, y_train shape = {y_train.shape}")
 
     # 4. 内存优化：分批收集测试数据
     print("Collecting test data...")
-    X_test_list, y_test_list = [], []
-
-    for batch in tqdm(test_loader, desc="Processing test batches"):
-        pixels = batch['pixels'].cpu().numpy()
-        pixels_mean = np.mean(pixels, axis=-1)
-        X_batch = np.transpose(pixels_mean, (0, 2, 1))
-        y_batch = batch['label'].cpu().numpy()
-
-        X_test_list.append(X_batch)
-        y_test_list.append(y_batch)
-
-        # 同样的内存控制
-        if len(X_test_list) > 100:
-            X_test_temp = np.vstack(X_test_list)
-            y_test_temp = np.hstack(y_test_list)
-
-            if 'X_test' not in locals():
-                X_test, y_test = X_test_temp, y_test_temp
-            else:
-                X_test = np.vstack([X_test, X_test_temp])
-                y_test = np.hstack([y_test, y_test_temp])
-
-            X_test_list, y_test_list = [], []
-
-    # 处理剩余的测试数据
-    if X_test_list:
-        X_test_temp = np.vstack(X_test_list)
-        y_test_temp = np.hstack(y_test_list)
-        if 'X_test' not in locals():
-            X_test, y_test = X_test_temp, y_test_temp
-        else:
-            X_test = np.vstack([X_test, X_test_temp])
-            y_test = np.hstack([y_test, y_test_temp])
-
-    print(f"Test data collected: X_test shape = {X_test.shape}, y_test shape = {y_test.shape}")
+    x_test, y_test = data_collect(test_loader)
+    print(f"Test data collected: X_test shape = {x_test.shape}, y_test shape = {y_test.shape}")
 
     # 5. 关键修改：使用 pyrregular 的 ROCKET
     print("\n=> Training ROCKET classifier (pyrregular version)")
-    from pyrregular.models.rocket import rocket_pipeline  # 正确导入
+
     model = rocket_pipeline  # 直接使用 pyrregular 的 pipeline
-
-    # 6. 训练模型（分批或使用子集，取决于内存）
-    print(f"Starting training with {len(X_train)} samples...")
-
-    # 如果内存仍然不够，可以进一步采样子集
-    if len(X_train) > 20000:  # 如果训练样本超过20000，随机采样
-        print(f"Dataset too large ({len(X_train)} samples), sampling 20000 for training...")
-        indices = np.random.choice(len(X_train), 20000, replace=False)
-        X_train_subset = X_train[indices]
-        y_train_subset = y_train[indices]
-        model.fit(X_train_subset, y_train_subset)
-        print("Training completed on sampled subset.")
-    else:
-        model.fit(X_train, y_train)
-        print("Training completed on full dataset.")
+    model.fit(x_train, y_train)
+    print("Training completed on full dataset.")
 
     # 7. 评估（同样可能需要采样）
-    print("Evaluating on training set...")
-    if len(X_train) > 50000:  # 如果训练集太大，采样评估
-        eval_indices = np.random.choice(len(X_train), 50000, replace=False)
-        train_score = model.score(X_train[eval_indices], y_train[eval_indices])
-    else:
-        train_score = model.score(X_train, y_train)
 
     print("Evaluating on test set...")
     print("Evaluating on training set...")
 
     # 预测训练集
-    if len(X_train) > 50000:  # 如果训练集太大，采样评估
-        eval_indices = np.random.choice(len(X_train), 50000, replace=False)
-        y_train_pred = model.predict(X_train[eval_indices])
-        y_train_true = y_train[eval_indices]
-    else:
-        y_train_pred = model.predict(X_train)
-        y_train_true = y_train
+    y_train_pred = model.predict(x_train)
+    y_train_true = y_train
 
     train_acc = (y_train_pred == y_train_true).mean()
     train_f1 = f1_score(y_train_true, y_train_pred, average='macro')
@@ -366,13 +313,8 @@ def train_rocket(args):
     print("Evaluating on test set...")
 
     # 预测测试集
-    if len(X_test) > 50000:  # 如果测试集太大，采样评估
-        eval_indices = np.random.choice(len(X_test), 50000, replace=False)
-        y_test_pred = model.predict(X_test[eval_indices])
-        y_test_true = y_test[eval_indices]
-    else:
-        y_test_pred = model.predict(X_test)
-        y_test_true = y_test
+    y_test_pred = model.predict(x_test)
+    y_test_true = y_test
 
     test_acc = (y_test_pred == y_test_true).mean()
     test_f1 = f1_score(y_test_true, y_test_pred, average='macro')
@@ -396,7 +338,7 @@ def train_rocket(args):
     target_name = match(config.target)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    file_name = f'./results/{source_name}/{target_name}/pyrregular_ROCKET_{len(X_train)}_{timestamp}.csv'
+    file_name = f'./results/{source_name}/{target_name}/pyrregular_ROCKET_{len(x_train)}_{timestamp}.csv'
     Path(file_name).parent.mkdir(parents=True, exist_ok=True)
 
     results_df = pd.DataFrame({

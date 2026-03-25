@@ -1,0 +1,5 @@
+metric,value
+train_accuracy,0.9994166666666666
+train_macro_f1,0.9994236774709004
+test_accuracy,0.37077033837293016
+test_macro_f1,0.20466806938868654
