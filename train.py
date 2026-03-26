@@ -150,8 +150,11 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
     pixels = batch_dict['pixels']  # [B, T, C, N]
     valid_pixels = batch_dict['valid_pixels']  # [B, T, N] - 注意这个维度！
     pixel_labels = batch_dict['pixel_labels']  # [B, N]
+    doy = batch_dict['positions']
 
     B, T, C, N = pixels.shape
+
+    doy = doy.repeat_interleave(N, dim=0)  # (B*N, T)
 
     # --- Step 1: 展平所有样本 ---
     # [B, T, C, N] -> [S, C, T] where S = B * N
@@ -193,7 +196,7 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
 
     y_np = y_flat.cpu().numpy() if torch.is_tensor(y_flat) else y_flat
 
-    return x_np, y_np
+    return x_np, y_np, doy
 
 
 def train_rocket(args):
@@ -244,46 +247,53 @@ def train_rocket(args):
 
     # 3. 内存优化：分批收集训练数据
     def data_collect(data_loader):
-        x_temp , y_temp = [], []
+        x_temp , y_temp , doy_temp = [], [], []
         first_batch = True
         for batch in tqdm(data_loader, desc="Processing batches"):
-            x, y =shape_adjust(batch)
+            x, y, doy =shape_adjust(batch)
 
             x_temp.append(x)
             y_temp.append(y)
+            doy_temp.append(doy)
 
             # 控制列表长度，避免内存溢出
             if len(x_temp) > 10:  # 每100个batch合并一次
                 x_temp = np.vstack(x_temp)
+                doy_temp = np.vstack(doy_temp)
                 y_temp = np.hstack(y_temp)
                 if first_batch:
-                    x_res, y_res = x_temp, y_temp
+                    x_res, y_res, doy_res = x_temp, y_temp, doy_temp
                     first_batch = False
                 else:
                     x_res = np.vstack([x_res, x_temp])
                     y_res = np.hstack([y_res, y_temp])
+                    doy_res = np.vstack([doy_res, doy_temp])
 
-                x_temp, y_temp = [], []  # 清空临时列表
+                x_temp, y_temp, doy_temp = [], [], []  # 清空临时列表
 
         # 处理剩余的数据
         if x_temp:
             x_temp = np.vstack(x_temp)
             y_temp = np.hstack(y_temp)
+            doy_temp = np.vstack(doy_temp)
             if first_batch:
-                x_res, y_res = x_temp, y_temp
+                x_res, y_res, doy_res = x_temp, y_temp, doy_temp
+                first_batch = False
             else:
                 x_res = np.vstack([x_res, x_temp])
                 y_res = np.hstack([y_res, y_temp])
+                doy_res = np.vstack([doy_res, doy_temp])
         assert x_res is not None, "dataloader is empty"
-        return x_res, y_res
+        return x_res, y_res, doy_res
 
     print("Collecting training data...")
-    x_train, y_train = data_collect(source_loader)
+    x_train, y_train, doy_train = data_collect(source_loader)
 
     os.makedirs("dataset_npy", exist_ok=True)
-    if not os.path.exists("dataset_npy/train.npy"):
-        np.save("dataset_npy/dataset.npy", x_train)
-        np.save("dataset_npy/dataset_labels.npy", y_train)
+    # if not os.path.exists("dataset_npy/train.npy"):
+    np.save("dataset_npy/dataset.npy", x_train)
+    np.save("dataset_npy/dataset_labels.npy", y_train)
+    np.save("dataset_npy/dataset_doy.npy", doy_train)
 
     da = convert_Dataset.read_original_version(verbose=True)
     x_train, global_doy = da.irr.to_dense(normalize_time=True)
@@ -295,7 +305,7 @@ def train_rocket(args):
 
     # 4. 内存优化：分批收集测试数据
     print("Collecting test data...")
-    x_test, y_test = data_collect(test_loader)
+    x_test, y_test, _ = data_collect(test_loader)
     print(f"Test data collected: X_test shape = {x_test.shape}, y_test shape = {y_test.shape}")
 
     # 5. 关键修改：使用 pyrregular 的 ROCKET
