@@ -35,6 +35,7 @@ def _find_2d_breakpoints(a, b):
 def remove_fill_values_from_time_idx(
     coords, ts_level=True, ts_idx=0, signal_idx=1, time_idx=-1
 ):
+    coords = coords.copy()  # yield continuous numpy
     if ts_level:
         breakpoints = _find_breakpoints(coords[ts_idx, :])
     else:

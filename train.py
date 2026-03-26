@@ -4,6 +4,7 @@ This version strictly follows the provided example code structure.
 """
 
 import argparse
+import os
 import random
 import sys
 
@@ -32,6 +33,9 @@ from transforms import (
 from torchvision import transforms
 import torch.nn.functional as F
 from pyrregular.models.rocket import rocket_pipeline
+import xarray as xr
+from data_conversion import *
+from pyrregular.accessor import IrregularAccessor
 # --- Global Variables ---
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -41,7 +45,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Fine-tune MantisV2 on Timematch dataset.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--device', default='cuda:0', type=str, help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
-    parser.add_argument('--per', default=1, type=float, help='Percentage of labeled samples to use for training/validation.')
+    parser.add_argument('--per', default=0.4, type=float, help='Percentage of labeled samples to use for training/validation.')
     parser.add_argument('--seed', default=111, type=int, help='Random seed for reproducibility.')
     parser.add_argument('--num_workers', default=2, type=int, help='Number of workers for data loading.')
     parser.add_argument('--batch_size', type=int, default=500, help='Batch size for training.')
@@ -140,16 +144,9 @@ def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1,
         folds.append(splits)
     return folds
 
-def resize(X, size):
-    X_scaled = F.interpolate(torch.tensor(X, dtype=torch.float), size=size, mode='linear', align_corners=False)
-    return X_scaled.numpy()
 
 
 def shape_adjust(batch_dict, doy_p=False, seq_len=32):
-    """
-    核心函数：将 batch_dict 转换为 MantisV2 所需的 (X, y) 格式。
-    关键修复：在此处利用 'valid_pixels' 处理全无效时间步样本，防止 NaN。
-    """
     pixels = batch_dict['pixels']  # [B, T, C, N]
     valid_pixels = batch_dict['valid_pixels']  # [B, T, N] - 注意这个维度！
     pixel_labels = batch_dict['pixel_labels']  # [B, N]
@@ -157,8 +154,8 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
     B, T, C, N = pixels.shape
 
     # --- Step 1: 展平所有样本 ---
-    # [B, T, C, N] -> [S, T, C] where S = B * N
-    x_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)  # (S, T, C)
+    # [B, T, C, N] -> [S, C, T] where S = B * N
+    x_flat = pixels.permute(0, 3, 2, 1).reshape(-1, C, T)
     y_flat = pixel_labels.reshape(-1)  # (S,)
     valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T)  # (S, T)
 
@@ -175,16 +172,16 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
     # --- Step 3: 使用 valid_flat 清洗 x_flat ---
     # 策略：将无效时间步的数据替换为该像素在有效时间步上的均值
     x = x_flat.clone()
-    for i in range(x_flat.shape[0]):
-        valid_idx = valid_flat[i].bool()  # (T,)
-        if valid_idx.any():
-            # 计算每个通道在有效时间步上的均值 [C]
-            mean_vals = x_flat[i, valid_idx, :].mean(dim=0, keepdim=True)  # (1, C)
-            # 将无效时间步替换为均值
-            x[i, ~valid_idx, :] = mean_vals
-        else:
-            # 理论上不会发生，因为上面已经修复了
-            x[i] = 0.0
+    # for i in range(x_flat.shape[0]):
+    #     valid_idx = valid_flat[i].bool()  # (T,)
+    #     if valid_idx.any():
+    #         # 计算每个通道在有效时间步上的均值 [C]
+    #         mean_vals = x_flat[i, valid_idx, :].mean(dim=0, keepdim=True)  # (1, C)
+    #         # 将无效时间步替换为均值
+    #         x[i, ~valid_idx, :] = mean_vals
+    #     else:
+    #         # 理论上不会发生，因为上面已经修复了
+    #         x[i] = 0.0
 
 
 
@@ -201,6 +198,7 @@ def shape_adjust(batch_dict, doy_p=False, seq_len=32):
 
 def train_rocket(args):
     """使用 pyrregular 的 ROCKET 模型（正确实现）"""
+    print("Has .irr:", hasattr(xr.DataArray, 'irr'))
     print("=> Creating dataloader")
     config = args
 
@@ -249,16 +247,13 @@ def train_rocket(args):
         x_temp , y_temp = [], []
         first_batch = True
         for batch in tqdm(data_loader, desc="Processing batches"):
-            pixels = batch['pixels'].cpu().numpy()
-            pixels_mean = np.mean(pixels, axis=-1)  # [B, T, C]
-            x = np.transpose(pixels_mean, (0, 2, 1))  # [B, C, T]
-            y = batch['label'].cpu().numpy()
+            x, y =shape_adjust(batch)
 
             x_temp.append(x)
             y_temp.append(y)
 
             # 控制列表长度，避免内存溢出
-            if len(x_temp) > 100:  # 每100个batch合并一次
+            if len(x_temp) > 10:  # 每100个batch合并一次
                 x_temp = np.vstack(x_temp)
                 y_temp = np.hstack(y_temp)
                 if first_batch:
@@ -284,6 +279,18 @@ def train_rocket(args):
 
     print("Collecting training data...")
     x_train, y_train = data_collect(source_loader)
+
+    os.makedirs("dataset_npy", exist_ok=True)
+    if not os.path.exists("dataset_npy/train.npy"):
+        np.save("dataset_npy/dataset.npy", x_train)
+        np.save("dataset_npy/dataset_labels.npy", y_train)
+
+    da = convert_Dataset.read_original_version(verbose=True)
+    x_train, global_doy = da.irr.to_dense(normalize_time=True)
+    print("Dense X shape:", x_train.shape)
+    print("Global time axis length:", len(global_doy))
+    print("Global time sample:", global_doy[:5], "...", global_doy[-5:])
+    # y_train, _ = da.irr.get_task_target_and_split()
     print(f"Training data collected: X_train shape = {x_train.shape}, y_train shape = {y_train.shape}")
 
     # 4. 内存优化：分批收集测试数据
